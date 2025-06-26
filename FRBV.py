@@ -1,14 +1,13 @@
 """
-FRBV.py
+FRBV_Fixed.py
 A professional script to generate creative titles and stories using an LLM via lmstudio.
-Updated to include random video speed between 1.5x and 1.75x and SRT subtitle generation.
-Fixed: Unload model and close LMStudio immediately after text generation.
+Completely rewritten with robust connection handling and proper cleanup.
 """
 import os
 import re
 import random
 import lmstudio as lms
-from typing import List
+from typing import List, Optional, Tuple
 import shutil
 from tqdm import tqdm
 import sys
@@ -17,8 +16,13 @@ from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip
 import requests
 import json
 from dotenv import load_dotenv
-import assemblyai as aai
 import traceback
+import subprocess
+import psutil
+import socket
+import signal
+import threading
+from contextlib import contextmanager
 
 # Load environment variables
 load_dotenv()
@@ -177,125 +181,6 @@ def pick_non_repeating_videos(folder_to_videos, count):
                     break
     return result
 
-def generate_srt_from_video(output_folder: str) -> None:
-    """Generate SRT subtitle file from the final video using AssemblyAI SDK."""
-    api_key = os.getenv('ASSEMBLY_AI_API_KEY')
-    if not api_key:
-        print("Warning: ASSEMBLY_AI_API_KEY not found in environment variables. Skipping SRT generation.")
-        return
-
-    video_path = os.path.join(output_folder, "final_output.mp4")
-    if not os.path.exists(video_path):
-        print(f"Error: Final video not found at {video_path}")
-        return
-
-    print("Generating SRT subtitles using AssemblyAI SDK...")
-
-    # Extract audio from video for transcription
-    temp_audio_path = os.path.join(output_folder, "temp_for_transcription.wav")
-    try:
-        with VideoFileClip(video_path) as video_clip:
-            audio_clip = video_clip.audio
-            audio_clip.write_audiofile(temp_audio_path, verbose=False, logger=None)
-            audio_clip.close()
-    except Exception as e:
-        print(f"Error extracting audio for transcription: {e}")
-        return
-
-    srt_path = os.path.join(output_folder, "subtitles.srt")
-    try:
-        aai.settings.api_key = api_key
-        transcriber = aai.Transcriber()
-        print("Uploading and transcribing audio with AssemblyAI SDK...")
-        transcript = transcriber.transcribe(temp_audio_path)
-        
-        # Fixed: Use polling instead of wait_till_complete
-        print("Waiting for transcription to complete...")
-        while transcript.status not in ['completed', 'error']:
-            time.sleep(5)  # Wait 5 seconds before checking again
-            transcript = transcriber.get_transcript(transcript.id)
-        
-        if transcript.status != 'completed':
-            print(f"Transcription failed: {transcript.status}")
-            if hasattr(transcript, 'error'):
-                print(f"Error details: {transcript.error}")
-            return
-
-        # Export SRT subtitles
-        srt_content = transcript.export_subtitles_srt()
-        if not srt_content or not isinstance(srt_content, str) or len(srt_content.strip()) == 0:
-            print("Warning: AssemblyAI SDK did not return SRT content. No subtitles will be saved.")
-        else:
-            with open(srt_path, 'w', encoding='utf-8') as f:
-                f.write(srt_content)
-            print(f"SRT file generated: {srt_path}")
-            if not os.path.exists(srt_path):
-                print("Warning: SRT file was not created as expected.")
-                
-    except Exception as e:
-        print(f"Error during SRT generation: {e}")
-        # Try alternative approach if the SDK method fails
-        try:
-            print("Attempting alternative transcription method...")
-            # Use the transcript data directly if available
-            if hasattr(transcript, 'words') and transcript.words:
-                generate_srt_from_words(transcript.words, srt_path)
-                print(f"SRT file generated using alternative method: {srt_path}")
-            else:
-                print("No word-level data available for SRT generation")
-        except Exception as alt_e:
-            print(f"Alternative SRT generation also failed: {alt_e}")
-
-    finally:
-        # Clean up temporary audio file
-        if os.path.exists(temp_audio_path):
-            os.remove(temp_audio_path)
-
-def generate_srt_from_words(words, srt_path: str) -> None:
-    """Generate SRT file from word-level transcript data."""
-    if not words:
-        print("No word-level timestamps available")
-        return
-    
-    srt_content = []
-    subtitle_index = 1
-    
-    # Group words into subtitles (approximately 5-8 words per subtitle)
-    words_per_subtitle = 6
-    
-    for i in range(0, len(words), words_per_subtitle):
-        word_group = words[i:i + words_per_subtitle]
-        
-        start_time = word_group[0].start / 1000.0  # Convert ms to seconds
-        end_time = word_group[-1].end / 1000.0
-        
-        # Format timestamps for SRT (HH:MM:SS,mmm)
-        start_srt = format_timestamp_for_srt(start_time)
-        end_srt = format_timestamp_for_srt(end_time)
-        
-        # Combine words into text
-        text = ' '.join([word.text for word in word_group])
-        
-        # Add to SRT content
-        srt_content.append(f"{subtitle_index}")
-        srt_content.append(f"{start_srt} --> {end_srt}")
-        srt_content.append(text)
-        srt_content.append("")  # Empty line between subtitles
-        
-        subtitle_index += 1
-    
-    # Write SRT file
-    with open(srt_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(srt_content))
-
-def format_timestamp_for_srt(seconds: float) -> str:
-    """Format timestamp in seconds to SRT format (HH:MM:SS,mmm)."""
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    milliseconds = int((seconds % 1) * 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{milliseconds:03d}"
-
 def create_video_with_audio(output_folder: str):
     """Create a video with random background footage matching the audio duration, then randomly speed it up."""
     videos_root = os.path.join(os.path.dirname(__file__), "Videos")
@@ -407,187 +292,336 @@ def create_video_with_audio(output_folder: str):
             except:
                 pass
 
-def safe_model_operations(model, operation_name: str, operation_func):
-    """Safely perform model operations with error handling."""
+def force_kill_processes():
+    """Aggressively kill all LMStudio processes."""
     try:
-        return operation_func()
+        # Kill by process name patterns
+        kill_patterns = ["lms", "lmstudio", "LMStudio"]
+        
+        for pattern in kill_patterns:
+            # Try different kill methods
+            silent_system(f"pkill -9 -f {pattern}")
+            silent_system(f"killall -9 {pattern}")
+        
+        # Kill by PID if we can find any
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                proc_info = proc.info
+                if proc_info['name']:
+                    name_lower = proc_info['name'].lower()
+                    if any(pattern in name_lower for pattern in ['lms', 'lmstudio']):
+                        print(f"Force killing process: {proc_info['name']} (PID: {proc_info['pid']})")
+                        proc.kill()
+                        proc.wait(timeout=3)
+                
+                if proc_info['cmdline']:
+                    cmdline_str = ' '.join(proc_info['cmdline']).lower()
+                    if any(pattern in cmdline_str for pattern in ['lms', 'lmstudio']):
+                        print(f"Force killing LMStudio process (PID: {proc_info['pid']})")
+                        proc.kill()
+                        proc.wait(timeout=3)
+                        
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, psutil.TimeoutExpired):
+                pass
+        
+        # Additional cleanup
+        time.sleep(2)
+        
     except Exception as e:
-        print(f"Error during {operation_name}: {e}")
-        # Try to gracefully handle the error
-        if "websocket" in str(e).lower() or "connection" in str(e).lower():
-            print("Connection issue detected. Attempting to continue...")
-            # Don't raise the error, just log it
-            return None
-        else:
-            raise e
+        print(f"Error in force kill: {e}")
 
-def wait_for_lmstudio_server(max_wait=30, interval=2):
-    """Wait for the lmstudio server to be ready before proceeding."""
-    import socket
-    start = time.time()
-    while time.time() - start < max_wait:
+def wait_for_port_free(port: int = 1234, max_wait: int = 30) -> bool:
+    """Wait for port to be completely free."""
+    start_time = time.time()
+    while time.time() - start_time < max_wait:
         try:
-            # Try to connect to the default lmstudio websocket port
-            with socket.create_connection(("localhost", 1234), timeout=2):
-                return True
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                result = s.connect_ex(('localhost', port))
+                if result != 0:  # Port is free
+                    return True
         except Exception:
-            time.sleep(interval)
+            return True
+        time.sleep(0.5)
     return False
 
-def cleanup_lmstudio(model):
-    """Properly cleanup LMStudio model and server."""
-    try:
-        if model:
-            print("Unloading model...")
-            model.unload()
-    except Exception as e:
-        print(f"Error unloading model: {e}")
+def wait_for_lmstudio_ready(max_wait: int = 60) -> bool:
+    """Wait for LMStudio server to be ready."""
+    start_time = time.time()
+    print("Waiting for LMStudio server to be ready...")
     
-    try:
-        print("Stopping LMStudio server...")
-        silent_system("lms server stop")
-        # Give it a moment to properly shut down
+    while time.time() - start_time < max_wait:
+        try:
+            # Test the connection with a simple request
+            response = requests.get("http://localhost:1234/v1/models", timeout=3)
+            if response.status_code == 200:
+                print("LMStudio server is ready!")
+                time.sleep(1)  # Small additional wait
+                return True
+        except Exception:
+            pass
+        
+        elapsed = time.time() - start_time
+        print(f"Waiting for server... ({elapsed:.1f}s elapsed)")
         time.sleep(2)
-    except Exception as e:
-        print(f"Error stopping server: {e}")
+    
+    print(f"Timeout: LMStudio server not ready after {max_wait}s")
+    return False
 
-def generate_text_content():
-    """Generate title and story content using LMStudio. Returns (title, story, output_folder)."""
-    model = None
+def start_lmstudio_fresh():
+    """Start LMStudio server with complete cleanup first."""
+    print("=== Starting fresh LMStudio instance ===")
+    
+    # Step 1: Complete cleanup
+    print("Step 1: Cleaning up any existing instances...")
+    try:
+        subprocess.run(["lms", "server", "stop"], capture_output=True, timeout=10)
+    except:
+        pass
+    
+    force_kill_processes()
+    
+    # Step 2: Wait for port to be free
+    print("Step 2: Waiting for port to be free...")
+    if not wait_for_port_free(1234, 30):
+        print("Warning: Port may still be in use")
+    
+    # Step 3: Start server
+    print("Step 3: Starting LMStudio server...")
+    try:
+        # Start server in background
+        process = subprocess.Popen(
+            ["lms", "server", "start"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Give it time to start
+        time.sleep(5)
+        
+        # Check if process is still running
+        if process.poll() is None:
+            print("LMStudio server process started")
+            return True
+        else:
+            stdout, stderr = process.communicate()
+            print(f"LMStudio failed to start: {stderr}")
+            return False
+            
+    except Exception as e:
+        print(f"Error starting LMStudio: {e}")
+        return False
+
+def stop_lmstudio_complete():
+    """Complete shutdown of LMStudio."""
+    print("=== Stopping LMStudio ===")
+    
+    # Graceful shutdown first
+    try:
+        subprocess.run(["lms", "server", "stop"], capture_output=True, timeout=10)
+        time.sleep(2)
+    except:
+        pass
+    
+    # Force cleanup
+    force_kill_processes()
+    
+    # Wait for port to be free
+    wait_for_port_free(1234, 15)
+    print("LMStudio shutdown complete")
+
+def generate_with_lmstudio(title_prompt: str, story_prompt: str) -> Tuple[Optional[str], Optional[str]]:
+    """Generate title and story using LMStudio with isolated session."""
+    
+    # Start fresh LMStudio instance
+    if not start_lmstudio_fresh():
+        print("Failed to start LMStudio server")
+        return None, None
+    
+    # Wait for server to be ready
+    if not wait_for_lmstudio_ready(60):
+        print("LMStudio server not ready")
+        stop_lmstudio_complete()
+        return None, None
     
     try:
-        print("Starting LMStudio server...")
-        silent_system("lms server start")
+        print("Connecting to LMStudio...")
+        
+        # Try to connect with retries
+        model = None
+        for attempt in range(3):
+            try:
+                print(f"Connection attempt {attempt + 1}/3")
+                model = lms.llm("google/gemma-3-4b")
+                print("Model loaded successfully!")
+                break
+            except Exception as e:
+                print(f"Connection attempt {attempt + 1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(5)
+                else:
+                    raise RuntimeError("Failed to connect after 3 attempts")
+        
+        # Generate title
+        print("Generating title...")
+        title_messages = [
+            {"role": "system", "content": title_prompt},
+            {"role": "user", "content": get_random_question()}
+        ]
+        
+        title_response = model.respond({
+            "messages": title_messages,
+            "temperature": get_random_temperature(),
+            "stream": False
+        })
+        
+        if not title_response or not title_response.content:
+            raise RuntimeError("Empty title response")
+        
+        title = remove_think_sections(title_response.content)
+        print(f"Title generated: {title[:50]}...")
+        
+        # Generate story
+        print("Generating story...")
+        story_content = (
+            "Always keep the shared title as the first line of the story & do not make several paragraphs, "
+            "give the entire story in one single paragraph\n" + title
+        )
+        
+        story_messages = [
+            {"role": "system", "content": story_prompt},
+            {"role": "user", "content": story_content}
+        ]
+        
+        story_response = model.respond({
+            "messages": story_messages,
+            "temperature": get_random_temperature(),
+            "stream": False
+        })
+        
+        if not story_response or not story_response.content:
+            raise RuntimeError("Empty story response")
+        
+        story = remove_think_sections(story_response.content)
+        print("Story generated successfully!")
+        
+        return title, story
+        
+    except Exception as e:
+        print(f"Error during generation: {e}")
+        traceback.print_exc()
+        return None, None
+    
+    finally:
+        # Always cleanup
+        stop_lmstudio_complete()
 
-        # Wait for server to be ready before loading model
-        if not wait_for_lmstudio_server():
-            raise RuntimeError("Timed out waiting for lmstudio server to be ready.")
-
-        print("Loading model...")
-        model = lms.llm("google/gemma-3-4b")
-
-        # File paths
+def generate_text_content() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Generate title and story content. Returns (title, story, output_folder)."""
+    
+    try:
+        # Read prompts
         title_prompt_path = "System_Title_Prompt.txt"
         story_prompt_path = "System_Story_Prompt.txt"
         
         print("Reading system prompts...")
         system_prompt_title = read_file(title_prompt_path)
         system_prompt_story = read_file(story_prompt_path)
-
-        # Generate random input for title
-        random_question = get_random_question()
-        title_prompt = f"{random_question}"
-        messages_for_title = [
-            {"role": "system", "content": system_prompt_title},
-            {"role": "user", "content": title_prompt}
-        ]
-        title_temp = get_random_temperature()
         
-        print("Generating title...")
-        # Safe title generation
-        def generate_title():
-            return model.respond({
-                "messages": messages_for_title,
-                "temperature": title_temp,
-                "stream": False
-            }).content
+        # Generate content
+        title, story = generate_with_lmstudio(system_prompt_title, system_prompt_story)
         
-        response_title = safe_model_operations(model, "title generation", generate_title)
-        if response_title is None:
-            print("Failed to generate title. Using fallback.")
-            response_title = f"Generated Story - {random_question}"
+        if not title or not story:
+            print("Failed to generate content")
+            return None, None, None
         
-        cleaned_title = remove_think_sections(response_title)
-
-        # Create output folder for this run
+        # Create output folder
         output_base = "/media/lord/New Volume"
-        output_folder = create_output_folder(output_base, cleaned_title)
-        write_text_file(output_folder, "title.txt", cleaned_title)
-        print("Title saved successfully")
-
-        # Prepare messages for story generation
-        story_user_content = (
-            "Always keep the shared title as the first line of the story & do not make several paragraphs, "
-            "give the entire story in one single paragraph\n" + cleaned_title
-        )
-        messages_for_story = [
-            {"role": "system", "content": system_prompt_story},
-            {"role": "user", "content": story_user_content}
-        ]
-        story_temp = get_random_temperature()
+        output_folder = create_output_folder(output_base, title)
         
-        print("Generating story...")
-        # Safe story generation
-        def generate_story():
-            return model.respond({
-                "messages": messages_for_story,
-                "temperature": story_temp,
-                "stream": False
-            }).content
+        # Save files
+        write_text_file(output_folder, "title.txt", title)
+        write_text_file(output_folder, "storie.txt", story)
         
-        response_story = safe_model_operations(model, "story generation", generate_story)
-        if response_story is None:
-            print("Failed to generate story. Using fallback.")
-            response_story = f"{cleaned_title}\n\nThis is a generated story about the topic above."
-        
-        cleaned_story = remove_think_sections(response_story)
-        write_text_file(output_folder, "storie.txt", cleaned_story)
-        print("Story saved successfully")
-        
-        return cleaned_title, cleaned_story, output_folder
+        print("Content saved successfully!")
+        return title, story, output_folder
         
     except Exception as e:
-        print(f"Error during text generation: {e}")
+        print(f"Error in text generation: {e}")
         traceback.print_exc()
         return None, None, None
-    finally:
-        # Always cleanup LMStudio
-        cleanup_lmstudio(model)
 
 def run_once():
+    """Run the complete pipeline once."""
     steps = [
         "Generating title and story with LLM",
         "Generating audio narration", 
-        "Creating video with audio and applying random speed",
-        "Generating SRT subtitles"
+        "Creating video with audio and applying random speed"
     ]
     
     with tqdm(total=len(steps), file=sys.stdout, bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}') as pbar:
         try:
-            # Phase 1: Generate text content and immediately cleanup LMStudio
+            # Phase 1: Generate text content
             pbar.set_postfix_str(steps[0])
             title, story, output_folder = generate_text_content()
             
             if not title or not story or not output_folder:
                 print("Failed to generate text content. Aborting this run.")
-                return
+                return False
             
             pbar.update(1)
 
-            # Phase 2: Audio/Video processing (no LMStudio needed)
+            # Phase 2: Audio generation
             pbar.set_postfix_str(steps[1])
             generate_audio_from_story(story, output_folder)
             pbar.update(1)
 
+            # Phase 3: Video creation
             pbar.set_postfix_str(steps[2])
             create_video_with_audio(output_folder)
             pbar.update(1)
-
-            pbar.set_postfix_str(steps[3])
-            generate_srt_from_video(output_folder)
-            pbar.update(1)
             
             print(f"Run completed successfully! Output saved to: {output_folder}")
+            return True
 
         except Exception as e:
             print(f"An error occurred during processing: {e}")
             traceback.print_exc()
+            return False
 
 if __name__ == "__main__":
     try:
         num_runs = int(input("How many times should the program run? (Enter a number): "))
     except Exception:
         num_runs = 1
+    
+    successful_runs = 0
+    
     for i in range(num_runs):
-        print(f"\n--- Run {i+1} of {num_runs} ---\n")
-        run_once()
+        print(f"\n{'='*50}")
+        print(f"Run {i+1} of {num_runs}")
+        print(f"{'='*50}")
+        
+        # Ensure clean state before each run
+        if i > 0:
+            print("Ensuring clean state between runs...")
+            stop_lmstudio_complete()
+            time.sleep(5)
+        
+        success = run_once()
+        if success:
+            successful_runs += 1
+        
+        # Pause between runs (except after the last one)
+        if i < num_runs - 1:
+            print(f"\nCompleted run {i+1}. Preparing for next run...")
+            time.sleep(3)
+    
+    print(f"\n{'='*50}")
+    print(f"All runs completed!")
+    print(f"Successful runs: {successful_runs}/{num_runs}")
+    print(f"{'='*50}")
+    
+    # Final cleanup
+    stop_lmstudio_complete()
