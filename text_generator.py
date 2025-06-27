@@ -14,10 +14,16 @@ from utils import (
 )
 
 
-def generate_text_content():
-    """Generate title and story content using LMStudio. Returns (title, story, output_folder)."""
-
+def generate_text_content(custom_title=None):
+    """
+    Generate title and story content using LMStudio. 
+    
+    Args:
+        custom_title (str, optional): Custom title to use instead of generating one
         
+    Returns:
+        tuple: (title, story, output_folder)
+    """
     # Give the server some time to start
     time.sleep(5)
 
@@ -26,9 +32,7 @@ def generate_text_content():
         # Simple approach: Just start the server (like in llms.py)
         print("✓ Starting LMStudio server...")
         
-        
         print("✓ Loading model...")
-
         model = lms.llm(model_name)
 
         # File paths
@@ -39,14 +43,19 @@ def generate_text_content():
         system_prompt_title = read_file(title_prompt_path)
         system_prompt_story = read_file(story_prompt_path)
 
-        title_prompt = "Generate a creative title for a story based on either a Doctor or a Navy Officer" 
-        
-        print("✓ Generating title...")
-        
-        # Use the simpler approach from llms.py
-        full_title_prompt = f"{system_prompt_title}\n\nUser: {title_prompt}"
-        response_title = model.respond(full_title_prompt)
-        response_title = response_title.content
+        # Handle title generation or use custom title
+        if custom_title:
+            print(f"✓ Using custom title: {custom_title}")
+            response_title = custom_title
+        else:
+            title_prompt = "Generate a creative title for a story based on either a Doctor or a Navy Officer" 
+            
+            print("✓ Generating title...")
+            
+            # Use the simpler approach from llms.py
+            full_title_prompt = f"{system_prompt_title}\n\nUser: {title_prompt}"
+            response_title = model.respond(full_title_prompt)
+            response_title = response_title.content
         
         # Create output folder for this run
         output_base = "/media/lord/Local Disk"
@@ -72,6 +81,6 @@ def generate_text_content():
 
         return response_title, response_story, output_folder
           
-
     except Exception as e:
         print(f"Error {e}")
+        return None, None, None
